@@ -59,12 +59,12 @@ def createAnimationUpdate(blender_object, callback, rotation_mode, prefix="", ze
     backup_frame = scene.frame_current
     scene.frame_set(0)
     blender_object.update_tag(refresh={'OBJECT'})
-    scene.update()
+    updateScene()
 
     lcl_transform = blender_object.matrix_local.copy()
 
     scene.frame_set(backup_frame)
-    scene.update()
+    updateScene()
 
     if blender_object.animation_data:
         action = blender_object.animation_data.action
@@ -241,21 +241,35 @@ class Export(object):
             self.items.append(item)
 
     def evaluateGroup(self, blender_object, item, rootItem):
-        if blender_object.dupli_group is None or len(blender_object.dupli_group.objects) == 0:
+        dupli_group = None
+        dupli_offset = None
+
+        if hasattr(blender_object, 'dupli_group'):
+            # Für ältere Blender-Versionen
+            dupli_group = blender_object.dupli_group
+            if dupli_group is not None:
+                dupli_offset = dupli_group.dupli_offset
+        elif hasattr(blender_object, 'instance_collection'):
+            # Für neuere Blender-Versionen
+            dupli_group = blender_object.instance_collection
+            if dupli_group is not None:
+                dupli_offset = dupli_group.instance_offset
+
+        if dupli_group is None or len(dupli_group.objects) == 0:
             return
 
-        Log("resolving {} for {} offset {}".format(blender_object.dupli_group.name,
-                                                   blender_object.name,
-                                                   blender_object.dupli_group.dupli_offset))
+        Log("resolving {} for {} offset {}".format(dupli_group.name,
+                                                blender_object.name,
+                                                dupli_offset))
 
         group = MatrixTransform()
-        group.matrix = Matrix.Translation(-blender_object.dupli_group.dupli_offset)
+        group.matrix = Matrix.Translation(-dupli_offset)
         item.children.append(group)
 
-        # for group we disable the only visible
+        # For group we disable the only visible
         config_visible = self.config.only_visible
         self.config.only_visible = False
-        for o in blender_object.dupli_group.objects:
+        for o in dupli_group.objects:
             Log("object {}".format(o))
             self.exportChildrenRecursively(o, group, rootItem)
         self.config.only_visible = config_visible
@@ -267,8 +281,8 @@ class Export(object):
         return "no name"
 
     def isObjectVisible(self, blender_object):
-        return blender_object.is_visible(self.config.scene) or not self.config.only_visible
-
+        return blender_object.visible_get() or not self.config.only_visible
+    
     def createAnimationsObject(self,
                                osg_object,
                                blender_object,
@@ -342,14 +356,14 @@ class Export(object):
             osg_object = MatrixTransform()
             osg_object.setName(blender_object.name)
             osg_object.matrix = matrix
-            lightItem = self.createLight(blender_object)
+            # lightItem = self.createLight(blender_object)
             self.createAnimationsObject(osg_object, blender_object, self.config,
                                         createAnimationUpdate(blender_object,
                                                               UpdateMatrixTransform(name=osg_object.name),
                                                               rotation_mode),
                                         self.unique_objects,
                                         self.parse_all_actions)
-            osg_object.children.append(lightItem)
+            # osg_object.children.append(lightItem)
             return osg_object
 
         # Mesh, Camera and Empty objects
@@ -422,7 +436,7 @@ class Export(object):
             Log("Parsing object '{}' of type {}".format(blender_object.name, blender_object.type))
             if blender_object.type == "ARMATURE":
                 osg_object = parseArmature(blender_object)
-            elif blender_object.type == "LAMP" and is_visible:
+            elif blender_object.type == "LIGHT" and is_visible:
                 osg_object = parseLight(blender_object)
             elif blender_object.type in ['MESH', 'EMPTY', 'CAMERA']:
                 osg_object = parseBlenderObject(blender_object, is_visible)
@@ -512,7 +526,7 @@ class Export(object):
             renamed_count = checkNameEncoding(bpy.data.images, 'image', renamed_count)
             renamed_count = checkNameEncoding(bpy.data.curves, 'curve', renamed_count)
             renamed_count = checkNameEncoding(bpy.data.cameras, 'camera', renamed_count)
-            renamed_count = checkNameEncoding(bpy.data.lamps, 'lamp', renamed_count)
+            renamed_count = checkNameEncoding(bpy.data.lights, 'light', renamed_count)
             renamed_count = checkNameEncoding(bpy.data.metaballs, 'metaball', renamed_count)
 
             if renamed_count:
@@ -522,7 +536,7 @@ class Export(object):
             ''' Duplicates vertex instances and makes them real'''
             unselectAllObjects()
             # Select all objects that use dupli_vertex mode
-            selectObjects([obj for obj in scene.objects if obj.dupli_type == 'VERTS' and obj.children])
+            selectObjects([obj for obj in scene.objects if obj.instance_type == 'VERTS' and obj.children])
 
             # Duplicate all instances into real objects
             if bpy.context.selected_objects:
@@ -567,7 +581,7 @@ class Export(object):
 
             for obj in self.config.scene.objects:
                 Log("obj {}".format(obj.name))
-                if (self.config.selected == "SELECTED_ONLY_WITH_CHILDREN" and obj.select) or \
+                if (self.config.selected == "SELECTED_ONLY_WITH_CHILDREN" and obj.select_get()) or \
                    (self.config.selected == "ALL" and obj.parent is None):
                     self.exportItemAndChildren(obj)
         finally:
@@ -632,7 +646,7 @@ class Export(object):
             lm = LightModel()
             lm.ambient = (1.0, 1.0, 1.0, 1.0)
             if self.config.scene.world is not None:
-                amb = self.config.scene.world.ambient_color
+                amb = self.config.scene.world.color
                 lm.ambient = (amb[0], amb[1], amb[2], 1.0)
 
             st.attributes.append(lm)
@@ -767,7 +781,8 @@ class Export(object):
 
         # converting to mesh skips shape keys
         if self.config.apply_modifiers and has_non_armature_modifiers and not hasShapeKeys(mesh):
-            mesh_object = mesh.to_mesh(self.config.scene, True, 'PREVIEW')
+            dg = bpy.context.evaluated_depsgraph_get()
+            mesh_object = mesh.evaluated_get(dg).to_mesh(preserve_all_data_layers=True, depsgraph=dg)
         else:
             mesh_object = mesh.data
 
@@ -851,7 +866,7 @@ class Export(object):
         return geode
 
     def createLight(self, obj):
-        converter = BlenderLightToLightSource(lamp=obj)
+        converter = BlenderLightToLightSource(light=obj)
         lightsource = converter.convert()
         self.lights[lightsource.name] = lightsource  # will be used to index lightnum at the end
         return lightsource
@@ -859,83 +874,85 @@ class Export(object):
 
 class BlenderLightToLightSource(object):
     def __init__(self, *args, **kwargs):
-        self.object = kwargs["lamp"]
-        self.lamp = self.object.data
+        self.object = kwargs["light"]
+        self.light = self.object.data
 
     def convert(self):
+        return
+    
         ls = LightSource()
         ls.setName(self.object.name)
         light = ls.light
-        energy = self.lamp.energy
+        energy = self.light.energy
         light.ambient = (1.0, 1.0, 1.0, 1.0)
 
-        if self.lamp.use_diffuse:
-            light.diffuse = (self.lamp.color[0] * energy,
-                             self.lamp.color[1] * energy,
-                             self.lamp.color[2] * energy,
+        if self.light.diffuse_factor:
+            light.diffuse = (self.light.color[0] * energy,
+                             self.light.color[1] * energy,
+                             self.light.color[2] * energy,
                              1.0)
         else:
             light.diffuse = (0, 0, 0, 1.0)
 
-        if self.lamp.use_specular:
+        if self.light.specular_factor:
             light.specular = (energy, energy, energy, 1.0)  # light.diffuse
         else:
             light.specular = (0, 0, 0, 1.0)
 
         light.getOrCreateUserData().append(StringValueObject("source", "blender"))
         light.getOrCreateUserData().append(StringValueObject("Energy", str(energy)))
-        light.getOrCreateUserData().append(StringValueObject("Color", "[{}, {}, {}]".format(self.lamp.color[0],
-                                                                                            self.lamp.color[1],
-                                                                                            self.lamp.color[2])))
+        light.getOrCreateUserData().append(StringValueObject("Color", "[{}, {}, {}]".format(self.light.color[0],
+                                                                                            self.light.color[1],
+                                                                                            self.light.color[2])))
 
-        if self.lamp.use_diffuse:
+        if self.light.diffuse_factor:
             light.getOrCreateUserData().append(StringValueObject("UseDiffuse", "true"))
         else:
             light.getOrCreateUserData().append(StringValueObject("UseDiffuse", "false"))
 
-        if self.lamp.use_specular:
+        if self.light.specular_factor:
             light.getOrCreateUserData().append(StringValueObject("UseSpecular", "true"))
         else:
             light.getOrCreateUserData().append(StringValueObject("UseSpecular", "false"))
 
-        light.getOrCreateUserData().append(StringValueObject("Distance", str(self.lamp.distance)))
-        if self.lamp.type == 'POINT' or self.lamp.type == "SPOT":
-            light.getOrCreateUserData().append(StringValueObject("FalloffType", str(self.lamp.falloff_type)))
-            light.getOrCreateUserData().append(StringValueObject("UseSphere", str(self.lamp.use_sphere).lower()))
+        light.getOrCreateUserData().append(StringValueObject("Distance", str(self.light.distance)))
+        if self.light.type == 'POINT' or self.light.type == "SPOT":
+            light.getOrCreateUserData().append(StringValueObject("FalloffType", str(self.light.falloff_type)))
+            light.getOrCreateUserData().append(StringValueObject("UseSphere", str(self.light.use_sphere).lower()))
 
-        light.getOrCreateUserData().append(StringValueObject("Type", str(self.lamp.type)))
+        light.getOrCreateUserData().append(StringValueObject("Type", str(self.light.type)))
 
         # Lamp', 'Sun', 'Spot', 'Hemi', 'Area', or 'Photon
-        if self.lamp.type == 'POINT' or self.lamp.type == 'SPOT':
+        if self.light.type == 'POINT' or self.light.type == 'SPOT':
             # position light
             # Note DW - the distance may not be necessary anymore (blender 2.5)
             light.position = (0, 0, 0, 1)  # put light to vec3(0) it will inherit the position from parent transform
-            light.linear_attenuation = self.lamp.linear_attenuation / self.lamp.distance
-            light.quadratic_attenuation = self.lamp.quadratic_attenuation / self.lamp.distance
+            light.linear_attenuation = self.light.linear_attenuation / self.light.distance
+            light.quadratic_attenuation = self.light.quadratic_attenuation / self.light.distance
 
-            if self.lamp.falloff_type == 'CONSTANT':
+            if self.light.falloff_type == 'CONSTANT':
                 light.quadratic_attenuation = 0
                 light.linear_attenuation = 0
 
-            if self.lamp.falloff_type == 'INVERSE_SQUARE':
+            if self.light.falloff_type == 'INVERSE_SQUARE':
                 light.constant_attenuation = 0
                 light.linear_attenuation = 0
 
-            if self.lamp.falloff_type == 'INVERSE_LINEAR':
+            if self.light.falloff_type == 'INVERSE_LINEAR':
                 light.constant_attenuation = 0
                 light.quadratic_attenuation = 0
 
-        elif self.lamp.type == 'SUN':
+        elif self.light.type == 'SUN':
             light.position = (0, 0, 1, 0)  # put light to 0 it will inherit the position from parent transform
 
-        if self.lamp.type == 'SPOT':
-            light.spot_cutoff = math.degrees(self.lamp.spot_size * .5)
+        if self.light.type == 'SPOT':
+            light.spot_cutoff = math.degrees(self.light.spot_size * .5)
             if light.spot_cutoff > 90:
                 light.spot_cutoff = 180
-            light.spot_exponent = 128.0 * self.lamp.spot_blend
+            light.spot_exponent = 128.0 * self.light.spot_blend
 
-            light.getOrCreateUserData().append(StringValueObject("SpotSize", str(self.lamp.spot_size)))
-            light.getOrCreateUserData().append(StringValueObject("SpotBlend", str(self.lamp.spot_blend)))
+            light.getOrCreateUserData().append(StringValueObject("SpotSize", str(self.light.spot_size)))
+            light.getOrCreateUserData().append(StringValueObject("SpotBlend", str(self.light.spot_blend)))
 
         return ls
 
@@ -1001,7 +1018,6 @@ class BlenderObjectToGeometry(object):
         return texture
 
     def adjustUVLayerFromMaterial(self, geom, material, mesh_uv_textures):
-
         uvs = geom.uvs
         if DEBUG:
             Log("geometry uvs {}".format(uvs))
@@ -1055,6 +1071,12 @@ use an uv layer '{}' that does not exist on the mesh '{}'; using the first uv ch
         return
 
     def createStateSet(self, index_material, mesh):
+        """
+        Creates a StateSet for a Drawable of osg::Geometry type.
+        osg::Geometry holds the mesh data and StateSet is where
+        a material is written. If a Blender mesh has a material
+        it gets written as an Attribute of a StateSet of a Drawable.
+        """
         if len(mesh.materials) == 0:
             return None
 
@@ -1064,292 +1086,211 @@ use an uv layer '{}' that does not exist on the mesh '{}'; using the first uv ch
 
         if mat_source is None:
             return None
-
+        
+        # Stateset
         stateset = StateSet()
         self.unique_objects.registerStateSet(mat_source, stateset)
+        
+        # Material attribute
         material = Material()
         stateset.attributes.append(material)
+        
+        # Blend function attribute
+        blend_function = BlendFunc()
+        blend_function.dataVariance = "STATIC"
+        stateset.attributes.append(blend_function)
+        
+        # Alpha function attribute
+        if mat_source.blend_method == "CLIP":
+            alpha_function = AlphaFunc()
+            alpha_function.dataVariance = "STATIC"
+            stateset.attributes.append(alpha_function)
 
         # Setting dataVariance to Static since material animation is not supported
         for osg_object in (stateset, material):
             osg_object.dataVariance = "STATIC"
             osg_object.setName(mat_source.name)
-            osg_object.getOrCreateUserData().append(StringValueObject("source", "blender"))
-
-        if mat_source.use_nodes is True:
-            self.createStateSetShaderNode(mat_source, stateset, material)
-        else:
-            self.createStateSetMaterial(mat_source, stateset, material)
-
+        
+        self.createStateSetMaterial(mat_source, stateset)
         return stateset
 
-    def createStateSetShaderNode(self, mat_source, stateset, material):
+    def createStateSetMaterial(self, mat_source, stateset):
         """
-        Reads a shadernode to an osg stateset/material
+        Reads a blender material into an osg stateset/material        
+        Writes the following section (with values) of a material
+            Ambient TRUE Front Back
+            Diffuse TRUE Front Back
+            Specular TRUE Front Back
+            Emission TRUE Front Back
+            Shininess TRUE Front Back
         """
-        if self.config.json_shaders:
-            self.createStateSetShaderNodeJSON(mat_source, stateset, material)
-        else:
-            self.createStateSetShaderNodeUserData(mat_source, material)
-
-    def createStateSetShaderNodeJSON(self, mat_source, stateset, material):
-        """
-         Serializes a blender shadernode into a JSON object
-        """
-        source_tree = mat_source.node_tree
-
-        def createSocket(source_socket):
-            socket = {
-                "name": source_socket.name,
-                "type": source_socket.type,
-                "enabled": source_socket.enabled,
-                "links": []
-            }
-            for source_link in source_socket.links:
-                socket['links'].append({
-                    "from_node": source_link.from_node.name,
-                    "from_socket": source_link.from_socket.name,
-                    "to_node": source_link.to_node.name,
-                    "to_socket": source_link.to_socket.name
-                })
-
-            if hasattr(source_socket, 'default_value'):
-                value = source_socket.default_value
-                if isinstance(value, Vector) or str(type(value)) \
-                   in ["<class 'bpy_prop_array'>", "<class 'mathutils.Color'>"]:
-                    socket['default_value'] = [v for v in value]
-                else:
-                    socket['default_value'] = value
-
-            return socket
-
-        tree = {
-            "nodes": {}
-        }
-        texture_slot_id = 0
-        for source_node in source_tree.nodes:
-            node = {
-                "name": source_node.name,
-                "type": source_node.type,
-                "inputs": [createSocket(source_input) for source_input in source_node.inputs],
-                "outputs": [createSocket(source_output) for source_output in source_node.outputs]
-            }
-
-            if source_node.type == "TEX_IMAGE" and source_node.image is not None:
-                node["texture_mapping"] = {
-                    "mapping": source_node.texture_mapping.mapping
-                }
-                node["image"] = {
-                    "filepath_raw": source_node.image.filepath_raw,
-                    "use_alpha": source_node.image.use_alpha,
-                    "colorspace": source_node.image.colorspace_settings.name,
-                    "channels": source_node.image.channels
-                }
-                node["texture_slot"] = texture_slot_id
-
-                texture = self.createTexture2DFromNode(source_node)
-                stateset.texture_attributes.setdefault(texture_slot_id, []).append(texture)
-                texture_slot_id += 1
-
-            tree['nodes'][source_node.name] = node
-
-        # safely delete unused nodes
-        nodes = tree['nodes']
-        for name in list(nodes.keys()):
-            node = nodes[name]
-            if all(map(lambda socket: len(socket['links']) == 0, node['inputs'])) and \
-               all(map(lambda socket: len(socket['links']) == 0, node['outputs'])):
-                del nodes[name]
-
-        material.getOrCreateUserData().append(StringValueObject("NodeTree", json.dumps(tree)))
-
-    def createStateSetShaderNodeUserData(self, mat_source, material):
-        """
-        reads a shadernode to a basic material
-        """
-        userData = material.getOrCreateUserData()
-        for node in mat_source.node_tree.nodes:
-            if node.type == "BSDF_DIFFUSE":
-                if not node.inputs["Color"].is_linked:
-                    value = node.inputs["Color"].default_value
-                    userData.append(StringValueObject("DiffuseColor",
-                                                      "[{}, {}, {}]".format(value[0],
-                                                                            value[1],
-                                                                            value[2])))
-            elif node.type == "BSDF_GLOSSY":
-                if not node.inputs["Color"].is_linked:
-                    value = node.inputs["Color"].default_value
-                    userData.append(StringValueObject("SpecularColor",
-                                                      "[{}, {}, {}]".format(value[0],
-                                                                            value[1],
-                                                                            value[2])))
-
-    def createStateSetMaterial(self, mat_source, stateset, material):
-        """
-        Reads a blender material into an osg stateset/material
-        """
+        material = stateset.attributes[0]
+        blend_function = stateset.attributes[1]
+        
         anim = createAnimationMaterialAndSetCallback(material, mat_source, self.config, self.unique_objects)
         if anim:
-            self.material_animations[anim.name] = anim
-
-        if mat_source.use_shadeless:
-            stateset.modes["GL_LIGHTING"] = "OFF"
-
-        alpha = 1.0
-        if mat_source.use_transparency:
-            alpha = 1.0 - mat_source.alpha
-
-        refl = mat_source.diffuse_intensity
-        # we premultiply color with intensity to have rendering near blender for opengl fixed pipeline
-        material.diffuse = (mat_source.diffuse_color[0] * refl,
-                            mat_source.diffuse_color[1] * refl,
-                            mat_source.diffuse_color[2] * refl,
-                            alpha)
-
-        # if alpha not 1 then we set the blending mode on
-        if DEBUG:
-            Log("state material alpha {}".format(alpha))
-        if alpha != 1.0:
-            stateset.modes["GL_BLEND"] = "ON"
-
-        ambient_factor = mat_source.ambient
-        if bpy.context.scene.world:
-            material.ambient = ((bpy.context.scene.world.ambient_color[0]) * ambient_factor,
-                                (bpy.context.scene.world.ambient_color[1]) * ambient_factor,
-                                (bpy.context.scene.world.ambient_color[2]) * ambient_factor,
-                                1.0)
+            for osg_object in (stateset, material):
+                stateset.dataVariance = "DYNAMIC"
+            self.material_animations[anim.name] = anim        
+        
+        shader = None
+        if not mat_source.node_tree.nodes:
+            pass
         else:
-            material.ambient = (0, 0, 0, 1.0)
+            for node in mat_source.node_tree.nodes:    
+                if node.type == "EEVEE_SPECULAR" or node.type == "EMISSION":
+                    shader = node
+                    break        
+         
+        if shader is None:
+            stateset.modes["GL_BLEND"] = "OFF"
+            stateset.modes["GL_CULL_FACE"] = "OFF"
+            material.diffuse = (1.0, 1.0, 1.0, 1.0)      
+            material.ambient = (0.0, 0.0, 0.0, 1.0)
+            material.specular = (1.0, 1.0, 1.0, 1.0)
+            material.emission = (0.0, 0.0, 0.0, 1.0)       
+            material.shininess = 12.5
+        elif shader.type == "EEVEE_SPECULAR":
+            # ModeList
+            if mat_source.blend_method == 'BLEND':
+                stateset.modes["GL_BLEND"] = "ON"
+                alpha = 1 - shader.inputs[4].default_value
+            elif mat_source.blend_method == 'CLIP':
+                stateset.modes["GL_BLEND"] = "OFF"
+                alpha = 1.0
+            else:
+                stateset.modes["GL_BLEND"] = "OFF"
+                alpha = 1.0            
+            if mat_source.use_backface_culling:
+                stateset.modes["GL_CULL_FACE"] = "FRONT"
+            else:
+                stateset.modes["GL_CULL_FACE"] = "OFF"
+            
+            # Material
+            material.diffuse = (shader.inputs[0].default_value[0],
+                                shader.inputs[0].default_value[1],
+                                shader.inputs[0].default_value[2],
+                                alpha)      
+            material.ambient = (bpy.context.scene.world.color[0],
+                                bpy.context.scene.world.color[1],
+                                bpy.context.scene.world.color[2],
+                                1.0)
+            material.specular = (shader.inputs[1].default_value[0],
+                                 shader.inputs[1].default_value[1],
+                                 shader.inputs[1].default_value[2],
+                                 1.0)
+            material.emission = (shader.inputs[3].default_value[0],
+                                 shader.inputs[3].default_value[1],
+                                 shader.inputs[3].default_value[2],
+                                 1.0)        
+            material.shininess = ((1 - shader.inputs[2].default_value) * 100 / 512 ) * 128    
+        
+        elif shader.type == "EMISSION":
+            # ModeList
+            if mat_source.blend_method == 'BLEND':
+                stateset.modes["GL_BLEND"] = "ON"
+                alpha = min(shader.inputs[1].default_value, 1.0)
+            else:
+                stateset.modes["GL_BLEND"] = "OFF"
+                alpha = 1.0
+            if mat_source.use_backface_culling:
+                stateset.modes["GL_CULL_FACE"] = "FRONT"
+            else:
+                stateset.modes["GL_CULL_FACE"] = "OFF"
+            
+            # Material
+            material.diffuse = (0.0, 0.0, 0.0, alpha)       
+            material.ambient = (0.0, 0.0, 0.0, 0.0)
+            material.specular = (0.0, 0.0, 0.0, 0.0)
+            material.emission = (shader.inputs[0].default_value[0],
+                                shader.inputs[0].default_value[1],
+                                shader.inputs[0].default_value[2],
+                                1.0)        
+            material.shininess = 0
+            
+            # BlendFunc
+            blend_function.destination_rgb = "ONE"
+            blend_function.destination_alpha = "ONE"    
 
-        # we premultiply color with intensity to have rendering near blender for opengl fixed pipeline
-        spec = mat_source.specular_intensity
-        material.specular = (mat_source.specular_color[0] * spec,
-                             mat_source.specular_color[1] * spec,
-                             mat_source.specular_color[2] * spec,
-                             1)
-
-        emissive_factor = mat_source.emit
-        material.emission = (mat_source.diffuse_color[0] * emissive_factor,
-                             mat_source.diffuse_color[1] * emissive_factor,
-                             mat_source.diffuse_color[2] * emissive_factor,
-                             1)
-        material.shininess = (mat_source.specular_hardness / 512.0) * 128.0
 
         material_data = self.createStateSetMaterialData(mat_source, stateset)
 
-        if self.config.json_materials:
-            self.createStateSetMaterialJson(material_data, stateset)
-        else:
-            self.createStateSetMaterialUserData(material_data, stateset, material)
 
+
+
+        self.createStateSetMaterialUserData(material_data, stateset, material)
+        
         return stateset
 
     def createStateSetMaterialData(self, mat_source, stateset):
         """
-        Reads a blender material into an osg stateset/material json userdata
-        """
-        def premultAlpha(slot, data):
-            if slot.texture and slot.texture.image:
-                data["UsePremultiplyAlpha"] = slot.texture.image.alpha_mode == 'PREMULT'
-
-        def useAlpha(slot, data):
-            if slot.texture and slot.texture.use_alpha:
-                data["UseAlpha"] = True
+        Reads a blender material into an osg stateset/material json userdata.
+        Handles custom material user data and textures.
+        """                
 
         data = {}
-
-        data["DiffuseIntensity"] = mat_source.diffuse_intensity
-        data["DiffuseColor"] = [mat_source.diffuse_color[0],
-                                mat_source.diffuse_color[1],
-                                mat_source.diffuse_color[2]]
-
-        data["SpecularIntensity"] = mat_source.specular_intensity
-        data["SpecularColor"] = [mat_source.specular_color[0],
-                                 mat_source.specular_color[1],
-                                 mat_source.specular_color[2]]
-
-        data["SpecularHardness"] = mat_source.specular_hardness
-
-        if mat_source.use_shadeless:
-            data["Shadeless"] = True
+        shader = None
+        
+        # Let's check whether we are using the correct shader node to access its data
+        # We assume users are careful enough to only include a single shader node in
+        # the material node graph as we don't support anything else anyway.
+        if not mat_source.node_tree:
+            pass
+        if not mat_source.node_tree.nodes:
+            pass
         else:
-            data["Emit"] = mat_source.emit
-            data["Ambient"] = mat_source.ambient
-        data["Translucency"] = mat_source.translucency
-        data["DiffuseShader"] = mat_source.diffuse_shader
-        data["SpecularShader"] = mat_source.specular_shader
-        if mat_source.use_transparency:
-            data["Transparency"] = True
-            data["TransparencyMethod"] = mat_source.transparency_method
-
-        if mat_source.diffuse_shader == "TOON":
-            data["DiffuseToonSize"] = mat_source.diffuse_toon_size
-            data["DiffuseToonSmooth"] = mat_source.diffuse_toon_smooth
-
-        if mat_source.diffuse_shader == "OREN_NAYAR":
-            data["Roughness"] = mat_source.roughness
-
-        if mat_source.diffuse_shader == "MINNAERT":
-            data["Darkness"] = mat_source.roughness
-
-        if mat_source.diffuse_shader == "FRESNEL":
-            data["DiffuseFresnel"] = mat_source.diffuse_fresnel
-            data["DiffuseFresnelFactor"] = mat_source.diffuse_fresnel_factor
-
-        # specular
-        if mat_source.specular_shader == "TOON":
-            data["SpecularToonSize"] = mat_source.specular_toon_size
-            data["SpecularToonSmooth"] = mat_source.specular_toon_smooth
-
-        if mat_source.specular_shader == "WARDISO":
-            data["SpecularSlope"] = mat_source.specular_slope
-
-        if mat_source.specular_shader == "BLINN":
-            data["SpecularIor"] = mat_source.specular_ior
+            for node in mat_source.node_tree.nodes:    
+                if node.type == "EEVEE_SPECULAR" or node.type == "EMISSION":
+                    shader = node
+                    break
 
         data["TextureSlots"] = {}
-        texture_list = mat_source.texture_slots
-        if DEBUG:
-            Log("texture list {}".format(texture_list))
-
-        for i, texture_slot in enumerate(texture_list):
-            if texture_slot is None:
-                continue
-
-            texture = self.createTexture2D(texture_slot)
-            if DEBUG:
-                Log("texture {} {}".format(i, texture_slot))
-            if texture is None:
-                continue
-
-            data_texture_slot = data["TextureSlots"].setdefault(i, {})
-
-            for (use_map, name, factor) in (('use_map_diffuse', 'DiffuseIntensity', 'diffuse_factor'),
-                                            ('use_map_color_diffuse', 'DiffuseColor', 'diffuse_color_factor'),
-                                            ('use_map_alpha', 'Alpha', 'alpha_factor'),
-                                            ('use_map_translucency', 'Translucency', 'translucency_factor'),
-                                            ('use_map_specular', 'SpecularIntensity', 'specular_factor'),
-                                            ('use_map_color_spec', 'SpecularColor', 'specular_color_factor'),
-                                            ('use_map_mirror', 'Mirror', 'mirror_factor'),
-                                            ('use_map_normal', 'Normal', 'normal_factor'),
-                                            ('use_map_ambient', 'Ambient', 'ambient_factor'),
-                                            ('use_map_emit', 'Emit', 'emit_factor')):
-                if getattr(texture_slot, use_map):
-                    premultAlpha(texture_slot, data_texture_slot)
-                    useAlpha(texture_slot, data_texture_slot)
-                    data_texture_slot[name] = getattr(texture_slot, factor)
-
-            # use blend
-            data_texture_slot["BlendType"] = texture_slot.blend_type
-
-            stateset.texture_attributes.setdefault(i, []).append(texture)
-
-            try:
-                if t.source_image.getDepth() > 24:  # there is an alpha
-                    stateset.modes["GL_BLEND"] = "ON"
-            except:
-                pass
-
+        texture_list = []        
+        
+        if shader is not None:
+            for input in shader.inputs:
+                if input.links:
+                    if input.links[0].from_node.type != "TEX_IMAGE":
+                        continue
+                    elif not input.links[0].from_node.image:
+                        continue
+                    else:
+                        texture_list.append(input.links[0].from_node)
+        
+            if shader.type == "EEVEE_SPECULAR":
+                for i, texture_node in enumerate(texture_list):
+                    if texture_node is None:
+                        continue
+                    texture = self.createTexture2DFromNode(texture_node)
+                    
+                    # Name the texture so it's recognized by OpenMW
+                    if shader.inputs["Base Color"].links:
+                        if shader.inputs["Base Color"].links[0].from_node == texture_node:
+                            texture.name = "diffuseMap"
+                    if shader.inputs["Specular"].links:
+                        if shader.inputs["Specular"].links[0].from_node == texture_node:
+                            texture.name = "specularMap"
+                    if shader.inputs["Emissive Color"].links:
+                        if shader.inputs["Emissive Color"].links[0].from_node == texture_node:
+                            texture.name = "emissiveMap"
+                    if shader.inputs["Normal"].links:
+                        if shader.inputs["Normal"].links[0].from_node == texture_node:
+                            texture.name = "normalMap"                                    
+                    data_texture_slot = data["TextureSlots"].setdefault(i, {})
+                    data_texture_slot["BlendType"] = "MIX"
+                    stateset.texture_attributes.setdefault(0, []).append(texture)
+                    data_texture_slot["DiffuseColor"] = 1.0
+                        
+            elif shader.type == "EMISSION":
+                for i, texture_node in enumerate(texture_list):
+                    if texture_node is None:
+                        continue
+                    texture = self.createTexture2DFromNode(texture_node)
+                    texture.name = "DiffuseMap"
+                    data_texture_slot = data["TextureSlots"].setdefault(i, {})
+                    data_texture_slot["BlendType"] = "MIX"
+                    stateset.texture_attributes.setdefault(0, []).append(texture)
+                    data_texture_slot["DiffuseColor"] = 1.0
         return data
 
     def createStateSetMaterialJson(self, data, stateset):
@@ -1417,13 +1358,11 @@ use an uv layer '{}' that does not exist on the mesh '{}'; using the first uv ch
             geom = Geometry()
 
         geom.groups = {}
-        if bpy.app.version[0] >= 2 and bpy.app.version[1] >= 63:
-            faces = mesh.tessfaces
-            uv_textures = mesh.tessface_uv_textures
-            vertex_colors = mesh.tessface_vertex_colors.active
-        else:
-            faces = mesh.faces
-            uv_textures = mesh.uv_textures
+        mesh.calc_loop_triangles()
+        faces = mesh.loop_triangles
+        uv_textures = mesh.uv_layers
+        vertex_colors = mesh.vertex_colors.active
+
         if (len(faces) == 0):
             Log("object {} has no faces, so no materials".format(self.object.name))
             return None
@@ -1463,18 +1402,25 @@ use an uv layer '{}' that does not exist on the mesh '{}'; using the first uv ch
         vertex_index_map = {}
 
         def get_vertex_key(faceindex, facevertexindex):
+            loop = mesh.loop_triangles[faceindex].loops[facevertexindex]             
+
             if face.use_smooth:
-                normal = list(mesh.vertices[face.vertices[facevertexindex]].normal)
+                if mesh.has_custom_normals:
+                    normal = list(mesh.loops[loop].normal)
+                else:
+                    normal = list(mesh.vertices[face.vertices[facevertexindex]].normal)
             else:
                 normal = list(face.normal)
 
             if vertex_colors:
-                vcolors = tuple(getattr(vertex_colors.data[faceindex], 'color{}'.format(facevertexindex + 1)))
+                vcolors = tuple(list(vertex_colors.data[loop].color[:3]))
             else:
                 vcolors = tuple()
-
-            texcoords = [tuple(truncateVector(list(uv.data[faceindex].uv[facevertexindex])))
-                         for uv in mesh.tessface_uv_textures]
+            
+            # Get UV coordinates of the current vertex            
+            texcoords = []            
+            for uv in mesh.uv_layers:
+                texcoords.append(tuple(truncateVector(list(uv.data[loop].uv))))
             return (face.vertices[facevertexindex], tuple(truncateVector(normal)), tuple(texcoords), vcolors)
 
         for face in faces:
@@ -1492,8 +1438,8 @@ use an uv layer '{}' that does not exist on the mesh '{}'; using the first uv ch
                     morph_map.append(vert_index)
                     uvs = []
 
-                    for uv in mesh.tessface_uv_textures:
-                        uvs.append(uv.data[face.index].uv[facevertexindex])
+                    osg_vertexes.getArray().append(list(mesh.vertices[vert_index].co * self.config.scale_factor))
+                    osg_normals.getArray().append(key[1])
 
                     if self.object.vertex_groups:
                         for vertex_group in mesh.vertices[vert_index].groups:
@@ -1508,11 +1454,8 @@ use an uv layer '{}' that does not exist on the mesh '{}'; using the first uv ch
                                 else:
                                     vgroups[influence[0]].vertexes.append((newindex, vertex_group.weight))
 
-                    osg_normals.getArray().append(key[1])
-                    osg_vertexes.getArray().append(list(mesh.vertices[vert_index].co))
-                    # beware this enumerate, order can be different ?
-                    for idx, uv in enumerate(mesh.tessface_uv_textures):
-                        osg_uvs.setdefault(uv.name, TexCoordArray()).getArray().append(key[2][idx])
+                    for idx, uv_layer in enumerate(mesh.uv_layers):
+                        osg_uvs.setdefault(uv_layer.name, TexCoordArray()).getArray().append(key[2][idx])
 
                     if vertex_colors:
                         col = key[len(key) - 1]
@@ -1569,8 +1512,8 @@ use an uv layer '{}' that does not exist on the mesh '{}'; using the first uv ch
         if stateset is not None:
             geom.stateset = stateset
 
-        if len(mesh.materials) > 0 and mesh.materials[material_index] is not None:
-            self.adjustUVLayerFromMaterial(geom, mesh.materials[material_index], uv_textures)
+        #if len(mesh.materials) > 0 and mesh.materials[material_index] is not None:
+        #    self.adjustUVLayerFromMaterial(geom, mesh.materials[material_index], uv_textures)
 
         end_title = '-' * len(title)
         Log(end_title)
@@ -1581,8 +1524,7 @@ use an uv layer '{}' that does not exist on the mesh '{}'; using the first uv ch
         return geom
 
     def process(self, mesh):
-        if bpy.app.version[0] >= 2 and bpy.app.version[1] >= 63:
-            mesh.update(calc_tessface=True)  # Generates faces of 3 or 4 vertices
+        mesh.calc_loop_triangles()  # Generates faces of 3
 
         geometry_list = []
         material_index = 0
